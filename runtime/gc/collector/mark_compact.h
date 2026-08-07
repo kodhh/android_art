@@ -58,7 +58,7 @@ class MarkCompact final : public GarbageCollector {
   using SigbusCounterType = uint32_t;
 
   static constexpr size_t kAlignment = kObjectAlignment;
-  static constexpr int kCopyMode = -1;
+  static constexpr int kUffdMode = -1;
   // Fake file descriptor for fall back mode (when uffd isn't available)
   static constexpr int kFallbackMode = -3;
   static constexpr int kFdUnused = -2;
@@ -82,6 +82,8 @@ class MarkCompact final : public GarbageCollector {
   // Called by SIGBUS handler. NO_THREAD_SAFETY_ANALYSIS for mutator-lock, which
   // is asserted in the function.
   bool SigbusHandler(siginfo_t* info) REQUIRES(!lock_) NO_THREAD_SAFETY_ANALYSIS;
+  // Called by SIGSYS handler to detect seccomp deny-listed syscalls.
+  bool SigsysHandler(siginfo_t* info, void* context);
 
   GcType GetGcType() const override {
     return kGcTypeFull;
@@ -566,6 +568,8 @@ class MarkCompact final : public GarbageCollector {
   // returns. Returns number of bytes (multiple of page-size) mapped.
   size_t CopyIoctl(
       void* dst, void* buffer, size_t length, bool return_on_contention, bool tolerate_enoent);
+  // Move 'len/page-size' pages from 'src' to 'dst'.
+  size_t MoveIoctl(void* dst, void* src, size_t len, bool tolerate_enoent);
 
   // Called after updating linear-alloc page(s) to map the page. It first
   // updates the state of the pages to kProcessedAndMapping and after ioctl to
@@ -594,6 +598,15 @@ class MarkCompact final : public GarbageCollector {
   // is true.
   void UpdateClassTableClasses(Runtime* runtime, bool immune_class_table_only)
       REQUIRES_SHARED(Locks::mutator_lock_);
+
+  // Called to assess if it's safe to use MOVE ioctl, both from kernel bug-fixes
+  // as well as seccomp filter pov.
+  bool MoveIoctlKernelCheck();
+
+  // Return free pages from 'from-space' that can be used to copy objects into
+  // and then passed onto userfaultfd ioctls. Return nullptr if no page is
+  // available. Size must be a multiple of page-size.
+  uint8_t* GetFreePagesForMapping(size_t size, bool atomic);
 
   // For checkpoints
   Barrier gc_barrier_;
@@ -683,10 +696,12 @@ class MarkCompact final : public GarbageCollector {
   // All the pages in [last_reclaimable_page_, last_reclaimed_page_) in
   // from-space are available to store compacted contents for batching until the
   // next time madvise is called.
-  uint8_t* last_reclaimable_page_;
+  // Declared atomic as gc-thread may write to it while mutators are accessing
+  // it concurrently.
+  std::atomic<uint8_t*> last_reclaimable_page_;
   // [cur_reclaimable_page_, last_reclaimed_page_) have been used to store
   // compacted contents for batching.
-  uint8_t* cur_reclaimable_page_;
+  std::atomic<uint8_t*> cur_reclaimable_page_;
 
   space::ContinuousSpace* non_moving_space_;
   space::BumpPointerSpace* const bump_pointer_space_;
@@ -765,8 +780,6 @@ class MarkCompact final : public GarbageCollector {
   void* stack_high_addr_;
   void* stack_low_addr_;
 
-  uint8_t* conc_compaction_termination_page_;
-
   PointerSize pointer_size_;
   // Number of objects freed during this GC in moving space. It is decremented
   // every time an object is discovered. And total-object count is added to it
@@ -791,6 +804,8 @@ class MarkCompact final : public GarbageCollector {
   std::atomic<uint16_t> compaction_buffer_counter_;
   // True while compacting.
   bool compacting_;
+  // True if the MOVE ioctl is to be used during concurrent compaction.
+  bool use_move_ioctl_;
   // Set to true in MarkingPause() to indicate when allocation_stack_ should be
   // checked in IsMarked() for black allocations.
   bool marking_done_;
